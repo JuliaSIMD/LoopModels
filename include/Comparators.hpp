@@ -1,9 +1,12 @@
 #pragma once
 
 #include "./POSet.hpp"
+#include "Simplex.hpp"
 #include "Constraints.hpp"
 #include "Math.hpp"
+#include "NormalForm.hpp"
 #include "Symbolics.hpp"
+#include "llvm/ADT/Optional.h"
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -298,6 +301,188 @@ concept Comparator = requires(T t, llvm::ArrayRef<int64_t> x, int64_t y) {
     { t.equal(x, x) } -> std::convertible_to<bool>;
     { t.equalNegative(x, x) } -> std::convertible_to<bool>;
     { t.lessEqual(x, y) } -> std::convertible_to<bool>;
+};
+
+struct LinearSymbolicComparator : BaseComparator<LinearSymbolicComparator> {
+    IntMatrix U;
+    IntMatrix V;
+    llvm::Optional<llvm::SmallVector<int64_t, 16>> d;
+    size_t numRowDiff;
+    //llvm::SmallVector<int64_t, 16> sol;
+    static LinearSymbolicComparator construct(IntMatrix Ap) {
+        // std::cout << "start Test = " << std::endl;
+        const auto [numCon, numVar] = Ap.size();
+        IntMatrix A(numVar + numCon, 2 * numCon);
+        // A = [Ap' 0
+        //      S   I]
+        for (size_t i = 0; i < numCon; ++i)
+            for (size_t j = 0; j < numVar; ++j)
+                A(j, i) = Ap(i, j);
+
+        for (size_t j = 0; j < numCon; ++j) {
+            A(j + numVar, j) = -1;
+            A(j + numVar, j + numCon) = 1;
+        }
+        // std::cout << "A = " << A << std::endl;
+        // We will have query of the form Ax = q;
+        auto [H, U] = NormalForm::hermite(std::move(A));
+        // auto NS2 = NormalForm::nullSpace(H);
+        // std::cout << "H = " << H << std::endl;
+        // std::cout << "NS = " << NS2.numRow() << std::endl;
+        size_t R = H.numRow();
+        size_t numRowPre = R;
+        while ((R > 0) && allZero(H.getRow(R - 1)))
+            --R;
+        H.truncateRows(R);
+        size_t numRowDiff = numRowPre - R;
+        // std::cout << "H = " << H << std::endl;
+        // auto NS = NormalForm::nullSpace(H);
+        // std::cout << "NS = " << NS.numRow() << std::endl;
+        if (H.isSquare())
+            return LinearSymbolicComparator{.U = std::move(U), .V = std::move(H), .d = {}};
+        // std::cout << "H = " << H << std::endl;
+        // std::cout << "U = " << U << std::endl;
+        //std::cout << "U matrix:" << U << std::endl;
+        auto Ht = H.transpose();
+        // std::cout << "Ht matrix:" << Ht << std::endl;
+        auto Vt = IntMatrix::identity(Ht.numRow());
+        // Vt * Ht = D
+        // std::cout<< "Ht row size = " << Ht.numRow() <<std::endl;
+        NormalForm::solveSystem(Ht, Vt);
+        // std::cout << "Vt =" << Vt << std::endl;
+        // H * V = Diagonal(d)
+        // std::cout <<"D = " << Ht << std::endl;
+        auto d = Ht.diag();
+        printVector(std::cout << "D matrix:", d) << std::endl;
+        auto V = Vt.transpose();
+        return LinearSymbolicComparator{.U = std::move(U), .V = std::move(V), .d = std::move(d), .numRowDiff = numRowDiff} ;
+    };
+
+    bool greaterEqualZero(llvm::ArrayRef<int64_t> query) const {
+        std::cout << "----start testing greaterEqualZero-----"<< std::endl;
+        auto nVars = query.size();
+        auto nEqs = V.numCol() / 2;
+        if (!d.hasValue()) {
+            auto b = U.view(0, U.numRow(), 0, query.size()) * query;
+            // std::cout << "U =" << U << std::endl;
+            for (size_t i = V.numRow(); i < b.size(); ++i) {
+                if (b[i] != 0)
+                    return false;
+            }       
+            auto H = V;
+            // std::cout << "H = \n" << H << std::endl;
+            auto oldn = H.numCol();
+            H.resizeCols(oldn + 1);
+            // std::cout << "V = \n" << V << std::endl;
+            // std::cout << "H = \n" << H << std::endl;
+            for (size_t i = 0; i < H.numRow(); ++i)
+                H(i, oldn) = b[i];
+            NormalForm::solveSystem(H);
+            // std::cout <<"after solving:" << H << std::endl;
+            for (size_t i = nEqs; i < H.numRow(); ++i) {
+                if (auto rhs = H(i, oldn))
+                    if ((rhs > 0) != (H(i, i) > 0)) {
+                        std::cout    << "Wow: " << i << std::endl;
+                        return false;
+                    }
+            }
+            return true;
+        }
+        else{
+            // std::cout << "Col rank deficient" << std::endl;
+            //IntMatrix tmpU(U.numRow()-1, U.numCol());
+            // for (size_t i = 0; i < tmpU.numRow(); ++i)
+            //     for (size_t j = 0; j < tmpU.numCol(); ++j)
+            //         tmpU(i, j) = U(i, j);
+            auto tmpU = U.view(0, U.numRow()-numRowDiff, 0, U.numCol());
+            auto b = U.view(0, tmpU.numRow(), 0, query.size()) * query;
+            // std::cout << "b size 0= " << b.size() << std::endl;
+            IntMatrix J(nEqs, 2 * nEqs);
+            for (size_t i = 0; i < nEqs; ++i)
+                 J(i, i + nEqs) = 1;
+            auto dinv = d.getValue();
+            auto Dlcm = dinv[0];
+            for (size_t i = 1; i < dinv.size(); ++i){
+                Dlcm = lcm(Dlcm, dinv[i]);
+            }
+            for (size_t i = 0; i < dinv.size(); ++i){
+                dinv[i] = Dlcm / dinv[i];
+                // std::cout << "d inv i= " << dinv[i] << std::endl;
+            }
+            // std::cout << "d size = " << dinv.size() << std::endl;
+            // std::cout << "b size = " << b.size() << std::endl;
+            for (size_t i = 0; i < b.size(); ++i){
+                b[i] *= dinv[i];
+            }
+            // std::cout <<"Dlcm = " << Dlcm << std::endl;
+            auto JV1 = matmul(J, V.view(0, V.numRow(), 0, tmpU.numRow()));
+            //std::cout <<"JV1 = " << JV1 << std::endl;
+            auto c = JV1 * b;
+            auto NSdim = V.numRow() - tmpU.numRow();
+            IntMatrix expandW(nEqs, NSdim * 2 +1);
+            // auto JV2 = matmul(J, V.view(0, V.numRow(), tmpU.numRow(), V.numCol()));
+            // std::cout <<"JV2 = " << JV2 << std::endl;
+            // std::cout <<"V2 = " << V << std::endl;
+            for (size_t i = 0; i < nEqs; ++i)
+            {
+                expandW(i, 0) = c[i];
+                // expandW(i, 0) *= Dlcm;
+                for (size_t j = 0; j < NSdim; ++j){
+                    auto val = V(i, tmpU.numRow() + j) * Dlcm;
+                    //auto val = JV2(i, j) * Dlcm;
+                    // should change positive and negative?
+                    expandW(i, j + 1) = -val;
+                    expandW(i, j + NSdim + 1) = val;
+                }
+            }
+            // std::cout <<"expandW =" << expandW << std::endl;
+            IntMatrix Wcouple{0, expandW.numCol()};
+            llvm::Optional<Simplex> optS{Simplex::positiveVariables(expandW, Wcouple)};
+            //optS.hasValue()
+            // std::cout <<"size of dinv: " << dinv.size() << std::endl;
+            // std::cout <<"size of b: " << b.size() << std::endl;
+            // std::cout <<"has value " << optS.hasValue() << std::endl;
+            return optS.hasValue();
+        }
+        //for low rank deficient case:
+        //U: 10 x 10;
+        //Vt: 8 x 8;
+        //
+        // if (D.numRow() > D.numCol()){
+        //     auto const numCon = V.numRow()/2;
+        //     IntMatrix J(numCon, 2 * numCon);
+        //     for (size_t i = 0; i < numCon; ++i)
+        //         J(i, i + numCon) = 1;
+        //     IntMatrix q(query.size() + numCon,1);
+        //     for (size_t i = 0; i < query.size(); ++i)
+        //         q[i] = query[i];
+        //     size_t NSdim = D.numCol() - D.numRow();
+        //     // IntMatrix JV2(numCon, NSdim * 2);
+        //     IntMatrix JV1DiUq(numCon, 1);
+        //     // std::cout<< "J = " << J << std::endl;
+        //     // std::cout<< "V = " << V << std::endl;
+        //     auto JV1 = matmul(J, V.view(0, V.numRow(),0,numCon*2-NSdim));
+        //     auto JV1Di = matmul(std::move(JV1), D.view(0,numCon*2-NSdim,0,numCon*2));
+        //     //std::cout << "col size = " << U.numsCol() << std::endl;
+        //     auto b = matmul(U, std::move(q));
+        //     // std::cout << "JV1Di = " << JV1Di << std::endl;
+        //     // std::cout << "b = " << b << std::endl;
+        //     //identify b and JV1Dis size
+        //     auto c = matmul(std::move(JV1Di), std::move(b));
+        //     IntMatrix expandV2(numCon*2, NSdim * 2 + 1); //extra one dim for simplex
+        //     for (size_t i = 0; i < numCon * 2; ++i)
+        //     {
+        //         expandV2(i, 0) = c(i, 0);
+        //         for (size_t j = 0; j < NSdim * 2; ++j){
+        //             expandV2(i, j + 1) = V(i, j);
+        //             expandV2(i, j + NSdim + 1) = V(i, j);
+        //         }
+        //     }
+        //     IntMatrix B{0, expandV2.numCol()};
+        //     llvm::Optional<Simplex> optS{Simplex::positiveVariables(expandV2, B)};
+        return true;
+       // return optS.hasValue();
+    }
 };
 
 static constexpr void moveEqualities(IntMatrix &, EmptyMatrix<int64_t> &,
