@@ -1,6 +1,5 @@
 #pragma once
 
-#include "./AbstractEqualityPolyhedra.hpp"
 #include "./ArrayReference.hpp"
 #include "./Loops.hpp"
 #include "./Math.hpp"
@@ -28,7 +27,7 @@
 // 1 <= j_1 <= i_1
 // i_0 == i_1
 // j_0 == i_1
-struct DependencePolyhedra : SymbolicEqPolyhedra {
+struct DependencePolyhedra : Polyhedra<IntMatrix, SymbolicComparator> {
     size_t numDep0Var;
     llvm::SmallVector<int64_t, 2> nullStep;
     inline size_t getTimeDim() const { return nullStep.size(); }
@@ -36,7 +35,7 @@ struct DependencePolyhedra : SymbolicEqPolyhedra {
     inline size_t getDim1() const {
         return getNumVar() - numDep0Var - nullStep.size();
     }
-    inline size_t getNumEqualityConstraints() const { return q.size(); }
+    inline size_t getNumEqualityConstraints() const { return E.numRow(); }
     static llvm::Optional<llvm::SmallVector<std::pair<int, int>, 4>>
     matchingStrideConstraintPairs(const ArrayReference &ar0,
                                   const ArrayReference &ar1) {
@@ -182,10 +181,8 @@ struct DependencePolyhedra : SymbolicEqPolyhedra {
     // Where x = [inds0..., inds1..., time..]
 
     DependencePolyhedra(const MemoryAccess &ma0, const MemoryAccess &ma1)
-        : SymbolicEqPolyhedra(IntMatrix(), llvm::SmallVector<MPoly, 8>(),
-                              IntMatrix(), llvm::SmallVector<MPoly, 8>(),
-                              ma0.ref.loop->poset) {
-
+	: Polyhedra<IntMatrix, SymbolicComparator>{IntMatrix{},IntMatrix{},ma0.ref.loop.C} {
+	
         const ArrayReference &ar0 = ma0.ref;
         const ArrayReference &ar1 = ma1.ref;
         const llvm::Optional<llvm::SmallVector<std::pair<int, int>, 4>>
@@ -286,7 +283,7 @@ struct DependencePolyhedra : SymbolicEqPolyhedra {
     // c) constant terms eq
     // d) bound above eq
     //
-    // Time parameters are carried over into faras polys
+    // Time parameters are carried over into farkas polys
     std::pair<IntegerEqPolyhedra, IntegerEqPolyhedra> farkasPair() const {
 
         llvm::DenseMap<Polynomial::Monomial, unsigned> constantTerms;

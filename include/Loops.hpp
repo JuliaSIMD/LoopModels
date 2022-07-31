@@ -5,9 +5,13 @@
 #include "./Permutation.hpp"
 #include "./Polyhedra.hpp"
 #include "./Symbolics.hpp"
+#include "Comparators.hpp"
+#include "Constraints.hpp"
+#include "EmptyArrays.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <llvm/ADT/ArrayRef.h>
+#include <llvm/ADT/DenseMap.h>
 #include <llvm/ADT/IntrusiveRefCntPtr.h>
 #include <llvm/ADT/SmallVector.h>
 
@@ -17,327 +21,273 @@
 // extrema are the extremes, in orig order
 struct AffineLoopNest : SymbolicPolyhedra,
                         llvm::RefCountedBase<AffineLoopNest> {
-    Permutation perm; // maps current to orig
-    llvm::SmallVector<IntMatrix, 0> remainingA;
-    llvm::SmallVector<llvm::SmallVector<MPoly, 8>, 0> remainingB;
-    llvm::SmallVector<IntMatrix, 0> lowerA;
-    llvm::SmallVector<IntMatrix, 0> upperA;
-    llvm::SmallVector<llvm::SmallVector<MPoly, 8>, 0> lowerb;
-    llvm::SmallVector<llvm::SmallVector<MPoly, 8>, 0> upperb;
+    // struct AffineLoopNest : Polyhedra<EmptyMatrix<int64_t>,
+    // SymbolicComparator> {
 
-    int64_t currentToOriginalPerm(size_t i) const { return perm(i); }
+    static llvm::IntrusiveRefCntPtr<AffineLoopNest>
+    construct(const IntMatrix &A, llvm::ArrayRef<MPoly> b,
+              PartiallyOrderedSet poset) {
+        assert(b.size() == A.numRow());
+        // IntMatrix B;
+        llvm::SmallVector<Polynomial::Monomial> monomials;
+        llvm::DenseMap<Polynomial::Monomial, unsigned> map;
 
-    size_t getNumLoops() const { return getNumVar(); }
-    AffineLoopNest(IntMatrix Ain, llvm::SmallVector<MPoly, 8> bin,
-                   PartiallyOrderedSet posetin)
-        : SymbolicPolyhedra(std::move(Ain), std::move(bin), std::move(posetin)),
-          perm(A.numCol()), remainingA(A.numCol()), remainingB(A.numCol()),
-          lowerA(A.numCol()), upperA(A.numCol()), lowerb(A.numCol()),
-          upperb(A.numCol()) {
-        size_t numLoops = getNumLoops();
-        size_t i = numLoops;
-        pruneBounds(A, b);
-        remainingA[i - 1] = A;
-        remainingB[i - 1] = b;
-        do {
-            calculateBounds(--i);
-        } while (i);
+        for (auto &p : b)
+            for (auto &t : p)
+                if (!t.isCompileTimeConstant())
+                    if (map.insert(std::make_pair(t.exponent, map.size()))
+                            .second)
+                        monomials.push_back(t.exponent);
+        const size_t numMonomials = monomials.size();
+        auto ret = llvm::makeIntrusiveRefCnt<AffineLoopNest>();
+	auto &B = ret->A;
+        B.resize(A.numRow(), A.numCol() + 1 + map.size());
+        for (size_t r = 0; r < A.numRow(); ++r) {
+            for (auto &t : b[r]) {
+                size_t c = t.isCompileTimeConstant() ? 0 : map[t.exponent] + 1;
+                B(r, c) = t.coefficient;
+            }
+            for (size_t c = 0; c < A.numCol(); ++c)
+                B(r, c + 1 + numMonomials) = A(r, c);
+        }
+	ret->C = SymbolicComparator::construct(b, std::move(poset));
+	return ret;
+        // return llvm::makeIntrusiveRefCnt<AffineLoopNest>(
+        //     std::move(B), EmptyMatrix<int64_t>{},
+        //     SymbolicComparator::construct(b, std::move(poset)));
     }
-    void categorizeBoundsCache(const IntMatrix &A,
-                               const llvm::SmallVectorImpl<MPoly> &b,
-                               size_t i) {
 
-        categorizeBounds(lowerA[i], upperA[i], lowerb[i], upperb[i], A, b, i);
-    }
+    inline size_t getNumLoops() const { return getNumVar(); }
 
-    void swap(size_t _i, size_t _j) {
-        if (_i == _j) {
-            return;
+    llvm::IntrusiveRefCntPtr<AffineLoopNest>
+    rotate(PtrMatrix<const int64_t> R) const {
+        assert(R.numCol() == getNumLoops());
+        assert(R.numRow() == getNumLoops());
+        const size_t numConst = C.getNumConstTerms();
+        const auto [M, N] = A.size();
+        assert(numConst + getNumLoops() == N);
+        auto ret = llvm::makeIntrusiveRefCnt<AffineLoopNest>();
+	ret->C =C;
+        IntMatrix &B = ret->A;
+        B.resizeForOverwrite(M, N);
+        for (size_t m = 0; m < M; ++m) {
+            for (size_t n = 0; n < numConst; ++n)
+                B(m, n) = A(m, n);
+            for (size_t n = numConst; n < N; ++n)
+                B(m, n) = 0;
         }
-        perm.swap(_i, _j);
-        for (int64_t i = std::max(_i, _j); i >= int64_t(std::min(_i, _j));
-             --i) {
-            calculateBounds(i);
-        }
+        matmul(B.view(0, M, numConst, N), A.view(0, M, numConst, N), R);
+        std::cout << "A = \n" << A << std::endl;
+        std::cout << "R = \n" << R << std::endl;
+        std::cout << "B = \n" << B << std::endl;
+	return ret;
+        // return llvm::makeIntrusiveRefCnt<AffineLoopNest>(
+            // std::move(B), EmptyMatrix<int64_t>(), C);
     }
-    void calculateBounds0() {
-        const size_t i = perm(0);
-        const auto [numNeg, numPos] = countNonZeroSign(remainingA[0], i);
-        if ((numNeg > 1) | (numPos > 1)) {
-            IntMatrix Aold = remainingA[0];
-            llvm::SmallVector<MPoly, 8> bold = remainingB[0];
-            categorizeBoundsCache(Aold, bold, i);
-        } else {
-            categorizeBoundsCache(remainingA[0], remainingB[0], i);
-            return;
-        }
+    // AffineLoopNest(const IntMatrix &Ain, llvm::ArrayRef<MPoly> b,
+    //                PartiallyOrderedSet posetin)
+    //     : Polyhedra{symbolicPolyhedra(Ain, b, std::move(posetin))} {
+    //     pruneBounds();
+    // }
+    // AffineLoopNest(IntMatrix Ain, SymbolicComparator C)
+    //     : Polyhedra<EmptyMatrix<int64_t>, SymbolicComparator>{
+    //           .A = std::move(Ain),
+    //           .E = EmptyMatrix<int64_t>{},
+    //           .C = std::move(C)} {
+    //     pruneBounds();
+    // }
+    void removeLoopBang(size_t i) {
+        // for (size_t i = 0; i < A.numRow(); ++i)
+        // assert(!allZero(A.getRow(i)));
+        // std::cout << "removing i = " << i << "; A=\n" << A << std::endl;
+        fourierMotzkin(A, i + C.getNumConstTerms());
+        // std::cout << "removed i = " << i << "; A=\n" << A << std::endl;
+        // for (size_t i = 0; i < A.numRow(); ++i)
+        // assert(!allZero(A.getRow(i)));
+        pruneBounds();
+        // // std::cout << "After prune bounds i = " << i << "; A =\n"<< A <<
+        // // std::endl;
+        // for (size_t i = 0; i < A.numRow(); ++i)
+        //     assert(!allZero(A.getRow(i)));
+        // assert(allZero(A.getCol(i + C.getNumConstTerms())));
     }
-    // `_i` is w/ respect to current order, `i` for original order.
-    void calculateBounds(const size_t _i) {
-        if (_i == 0) {
-            return calculateBounds0();
-        }
-        const size_t i = perm(_i);
-        // const size_t iNext = perm(_i - 1);
-        remainingA[_i - 1] = remainingA[_i];
-        auto &Aold = remainingA[_i - 1];
-        remainingB[_i - 1] = remainingB[_i];
-        auto &bold = remainingB[_i - 1];
-        removeVariable(lowerA[i], upperA[i], lowerb[i], upperb[i], Aold, bold,
-                       i);
+    llvm::IntrusiveRefCntPtr<AffineLoopNest> removeLoop(size_t i) {
+        auto L{llvm::makeIntrusiveRefCnt<AffineLoopNest>(*this)};
+        // AffineLoopNest L = *this;
+        L->removeLoopBang(i);
+        return L;
     }
-    // returns true if extending (extendLower ? lower : upper) bound of `_i`th
-    // loop by `extend` doesn't result in the innermost loop experiencing any
-    // extra iterations.
-    // if `extendLower`, `min(i) - extend`
-    // else `max(i) + extend`
+    llvm::SmallVector<llvm::IntrusiveRefCntPtr<AffineLoopNest>>
+    perm(llvm::ArrayRef<unsigned> x) {
+        llvm::SmallVector<llvm::IntrusiveRefCntPtr<AffineLoopNest>> ret;
+        // llvm::SmallVector<AffineLoopNest, 0> ret;
+        ret.resize_for_overwrite(x.size());
+        ret.back() = this;
+        for (size_t i = x.size() - 1; i != 0;) {
+            llvm::IntrusiveRefCntPtr<AffineLoopNest> prev = ret[i];
+            // AffineLoopNest &prev = ret[i];
+            size_t oldi = i;
+            ret[--i] = prev->removeLoop(x[oldi]);
+        }
+        return ret;
+    }
+    std::pair<IntMatrix, IntMatrix> bounds(size_t i) {
+        const auto [numNeg, numPos] = countSigns(A, i);
+        std::pair<IntMatrix, IntMatrix> ret;
+        ret.first.resizeForOverwrite(numNeg, A.numCol());
+        ret.second.resizeForOverwrite(numPos, A.numCol());
+        size_t negCount = 0;
+        size_t posCount = 0;
+        for (size_t j = 0; j < A.numRow(); ++j) {
+            if (int64_t Aji = A(j, i))
+                (Aji < 0 ? ret.first : ret.second)
+                    .copyRow(A.getRow(j), (Aji < 0 ? negCount++ : posCount++));
+        }
+        return ret;
+    }
+    llvm::SmallVector<std::pair<IntMatrix, IntMatrix>, 0>
+    getBounds(llvm::ArrayRef<unsigned> x) {
+        llvm::SmallVector<std::pair<IntMatrix, IntMatrix>, 0> ret;
+        size_t i = x.size();
+        ret.resize_for_overwrite(i);
+        AffineLoopNest tmp = *this;
+        while (true) {
+            size_t xi = x[--i];
+            ret[i] = tmp.bounds(xi);
+            if (i == 0)
+                break;
+            tmp.removeLoopBang(xi);
+        }
+        return ret;
+    }
     bool zeroExtraIterationsUponExtending(size_t _i, bool extendLower) const {
-        size_t _j = _i + 1;
-        const size_t numLoops = getNumLoops();
-        if (_j == numLoops) {
-            return false;
-        }
-        // eliminate variables 0..._j
-        auto A = remainingA.back();
-        auto b = remainingB.back();
-        IntMatrix lwrA;
-        IntMatrix uprA;
-        llvm::SmallVector<MPoly, 16> lwrB;
-        llvm::SmallVector<MPoly, 16> uprB;
-        IntMatrix Atmp0, Atmp1, Etmp;
-        llvm::SmallVector<MPoly, 16> btmp0, btmp1, qtmp;
-        for (size_t _k = 0; _k < _j; ++_k) {
-            if (_k != _i) {
-                size_t k = perm(_k);
-                categorizeBounds(lwrA, uprA, lwrB, uprB, A, b, k);
-                deleteBounds(A, b, k);
-                appendBounds(lwrA, uprA, lwrB, uprB, Atmp0, Atmp1, Etmp, btmp0,
-                             btmp1, qtmp, A, b, k, Polynomial::Val<false>());
-            }
-        }
-        IntMatrix Anew;
-        llvm::SmallVector<MPoly, 8> bnew;
-        size_t i = perm(_i);
-        do {
-            // `A` and `b` contain representation independent of `0..._j`,
-            // except for `_i`
-            size_t j = perm(_j);
-            Anew = A;
-            bnew = b;
-            for (size_t _k = _i + 1; _k < numLoops; ++_k) {
-                if (_k != _j) {
-                    size_t k = perm(_k);
-                    // eliminate
-                    categorizeBounds(lwrA, uprA, lwrB, uprB, Anew, bnew, k);
-                    deleteBounds(Anew, bnew, k);
-                    appendBounds(lwrA, uprA, lwrB, uprB, Atmp0, Atmp1, Etmp,
-                                 btmp0, btmp1, qtmp, Anew, bnew, k,
-                                 Polynomial::Val<false>());
-                }
-            }
-            // now depends only on `j` and `i`
-            // check if we have zero iterations on loop `j`
-            // pruneBounds(Anew, bnew, j);
-            size_t numRows = Anew.numRow();
-            for (size_t l = 0; l < numRows; ++l) {
-                int64_t Ajl = Anew(l, j);
-                if (Ajl >= 0) {
-                    // then it is not a lower bound
-                    continue;
-                }
-                int64_t Ail = Anew(l, i);
-                for (size_t u = 0; u < numRows; ++u) {
-                    int64_t Aju = Anew(u, j);
-                    if (Aju <= 0) {
-                        // then it is not an upper bound
-                        continue;
-                    }
-                    int64_t Aiu = Anew(u, i);
-                    int64_t c = Ajl * Aiu - Aju * Ail;
-                    auto delta = bnew[l] * Aju;
-                    Polynomial::fnmadd(delta, bnew[u], Ajl);
-                    // delta + c * i >= 0 -> iterates at least once
-                    if (extendLower) {
-                        if (c > 0) {
-                            bool doesNotIterate = true;
-                            // we're adding to the lower bound
-                            for (size_t il = 0; il < numRows; ++il) {
-                                int64_t ail = Anew(il, i);
-                                if ((ail >= 0) || (Anew(il, j) != 0)) {
-                                    // (ail >= 0) means not a lower bound
-                                    // (Anew(il, j) != 0) means the lower bound
-                                    // is a function of `j` if we're adding
-                                    // beyond what `j` defines as the bound
-                                    // here, then `j` won't undergo extra
-                                    // iterations, due to being sandwiched
-                                    // between this bound, and whatever bound it
-                                    // was that defines the extrema we're adding
-                                    // to here.
-                                    continue;
-                                }
-                                // recall: ail < 0
-                                //
-                                // ail * i <= bnew[il]
-                                // i >= bnew[il] / ail
-                                //
-                                // ail * (i - e + e) <= bnew[il]
-                                // ail * (i - e) <= bnew[il] - ail*e
-                                // (i - e) >= (bnew[il] - ail*e) / ail
-                                ///
-                                // we want to check
-                                // delta + c * (i - e) >= 0
-                                // ail * (delta + c * (i - e)) <= 0
-                                // ail*delta + c*(ail * (i - e)) <= 0
-                                //
-                                // let c = c, for brevity
-                                //
-                                // c*ail*(i-e) <= c*(bnew[il] - ail*e)
-                                // we also wish to check
-                                // ail*delta + s*c*(ail*(i-e)) <= 0
-                                //
-                                // ail*delta + c*(ail*(i-e)) <=
-                                // ail*delta + c*(bnew[il] - ail*e)
-                                // thus, if
-                                // ail*delta + c*(bnew[il] - ail*e) <= 0
-                                // the loop iterates at least once
-                                // we'll check if it is known that this is
-                                // false, i.e. if
-                                //
-                                // ail*delta + c*(bnew[il] - ail*e) - 1 >= 0
-                                //
-                                // then the following must be
-                                // false:
-                                // ail*delta + c*(bnew[il] - ail*e) - 1 <= -1
-                                auto idelta = ail * delta;
-                                Polynomial::fnmadd(idelta, bnew[il], -c);
-                                // let e = 1
-                                idelta -= (c * ail + 1);
-                                if (knownGreaterEqualZero(idelta)) {
-                                    return true;
-                                } else {
-                                    doesNotIterate = false;
-                                }
-                            }
-                            if (doesNotIterate) {
-                                return true;
-                            }
-                        } else {
-                            continue;
-                        }
+        SymbolicPolyhedra tmp{*this};
+        const size_t numPrevLoops = getNumLoops() - 1;
+        // for (size_t i = 0; i < numPrevLoops; ++i)
+        // if (_i != i)
+        // tmp.removeLoopBang(i);
 
-                    } else {
-                        // extend upper
-                        if (c < 0) {
-                            bool doesNotIterate = true;
-                            // does `imax + e` iterate at least once?
-                            for (size_t il = 0; il < numRows; ++il) {
-                                int64_t ail = Anew(il, i);
-                                if ((ail <= 0) || (Anew(il, j) != 0)) {
-                                    // not an upper bound
-                                    continue;
-                                }
-                                // ail > 0, c < 0
-                                // ail * i <= ubi
-                                // c*ail*i >= c*ubi
-                                // c*ail*(i+e-e) >= c*ubi
-                                // c*ail*(i+e) >= c*ubi + c*ail*e
-                                //
-                                // iterates at least once if:
-                                // delta + c * (i+e) >= 0
-                                // ail*(delta + c * (i+e)) >= 0
-                                // ail*delta + ail*c*(i+e) >= 0
-                                // note
-                                // ail*delta + ail*c*(i+e) >=
-                                // ail*delta + c*ubi + c*ail+e
-                                // so proving
-                                // ail*delta + c*ubi + c*ail+e >= 0
-                                // proves the loop iterates at least once
-                                // we check if this is known to be false, i.e.
-                                // if this is known to be true:
-                                // - ail*delta - c*ubi - c*ail+e -1 >= 0
-                                auto idelta = (-ail) * delta;
-                                Polynomial::fnmadd(idelta, bnew[il], c);
-                                idelta -= (c * ail - 1);
-                                if (knownGreaterEqualZero(idelta)) {
-                                    return true;
-                                } else {
-                                    doesNotIterate = false;
-                                }
-                            }
-                            if (doesNotIterate) {
-                                return true;
-                            }
-                        } else {
-                            continue;
-                        }
-                    }
-                }
+        // for (size_t i = _i + 1; i < numPrevLoops; ++i)
+        // tmp.removeLoopBang(i);
+        for (size_t i = 0; i < numPrevLoops; ++i)
+            if (i != _i)
+                tmp.removeVariableAndPrune(i + C.getNumConstTerms());
+        bool indep = true;
+        const size_t numConst = C.getNumConstTerms();
+        for (size_t n = 0; n < tmp.A.numRow(); ++n)
+            if ((tmp.A(n, _i + numConst) != 0) &&
+                (tmp.A(n, numPrevLoops + numConst) != 0))
+                indep = false;
+        if (indep)
+            return false;
+        SymbolicPolyhedra margi{tmp};
+        margi.removeVariableAndPrune(numPrevLoops + C.getNumConstTerms());
+        SymbolicPolyhedra tmp2;
+        std::cout << "\nmargi=" << std::endl;
+        margi.dump();
+        std::cout << "\ntmp=" << std::endl;
+        tmp.dump();
+        // margi contains extrema for `_i`
+        // we can substitute extended for value of `_i`
+        // in `tmp`
+        int64_t sign = 2 * extendLower - 1; // extendLower ? 1 : -1
+        for (size_t c = 0; c < margi.getNumInequalityConstraints(); ++c) {
+            int64_t Aci = margi.A(c, _i + numConst);
+            int64_t b = sign * Aci;
+            if (b <= 0)
+                continue;
+            tmp2 = tmp;
+            // increment to increase bound
+            // this is correct for both extending lower and extending upper
+            // lower: a'x + i + b >= 0 -> i >= -a'x - b
+            // upper: a'x - i + b >= 0 -> i <=  a'x + b
+            // to decrease the lower bound or increase the upper, we increment
+            // `b`
+            ++margi.A(c, 0);
+            // our approach here is to set `_i` equal to the extended bound
+            // and then check if the resulting polyhedra is empty.
+            // if not, then we may have >0 iterations.
+            for (size_t cc = 0; cc < tmp2.A.numRow(); ++cc) {
+                int64_t d = tmp2.A(cc, _i + numConst);
+                if (d == 0)
+                    continue;
+                d *= sign;
+                for (size_t v = 0; v < tmp2.A.numCol(); ++v)
+                    tmp2.A(cc, v) = b * tmp2.A(cc, v) - d * margi.A(c, v);
             }
-            ++_j;
-        } while (_j != numLoops);
-        return false;
+            for (size_t cc = tmp2.A.numRow(); cc != 0;)
+                if (tmp2.A(--cc, numPrevLoops + numConst) == 0)
+                    eraseConstraint(tmp2.A, cc);
+            std::cout << "\nc=" << c << "; tmp2=" << std::endl;
+            tmp2.dump();
+            if (!(tmp2.isEmpty()))
+                return false;
+        }
+        return true;
     }
 
-    static void printBound(std::ostream &os, const IntMatrix &A,
-                           const llvm::SmallVector<MPoly, 8> &b, size_t i,
-                           int64_t sign) {
-
-        size_t numVar = A.numCol();
-        for (size_t j = 0; j < b.size(); ++j) {
-            if (A(j, i) == sign) {
+    // void printBound(std::ostream &os, const IntMatrix &A, size_t i,
+    void printBound(std::ostream &os, size_t i, int64_t sign) const {
+        const size_t numVar = getNumVar();
+        const size_t numConst = C.getNumConstTerms();
+        // printVector(std::cout << "A.getRow(i) = ", A.getRow(i)) << std::endl;
+        for (size_t j = 0; j < A.numRow(); ++j) {
+            int64_t Aji = A(j, i + numConst) * sign;
+            if (Aji <= 0)
+                continue;
+            if (A(j, i + numConst) == sign) {
                 if (sign < 0) {
-                    os << "i_" << i << " >= ";
-                } else {
                     os << "i_" << i << " <= ";
+                } else {
+                    os << "i_" << i << " >= ";
                 }
-            } else if (sign < 0) {
-                os << sign * A(j, i) << "*i_" << i << " >= ";
             } else {
-                os << sign * A(j, i) << "*i_" << i << " <= ";
+                os << Aji << "*i_" << i << ((sign < 0) ? " <= " : " >= ");
             }
-            bool printed = !isZero(b[j]);
-            if (printed) {
-                os << sign * b[j];
-            }
+            llvm::ArrayRef<int64_t> b = getSymbol(A, j);
+            bool printed = !allZero(b);
+            if (printed)
+                C.printSymbol(os, b, -sign);
             for (size_t k = 0; k < numVar; ++k) {
-                if (k == i) {
+                if (k == i)
                     continue;
-                }
-                if (int64_t lakj = A(j, k)) {
+                if (int64_t lakj = A(j, k + numConst)) {
                     if (lakj * sign > 0) {
                         os << " - ";
                     } else if (printed) {
                         os << " + ";
                     }
                     lakj = std::abs(lakj);
-                    if (lakj != 1) {
+                    if (lakj != 1)
                         os << lakj << "*";
-                    }
                     os << "i_" << k;
                     printed = true;
                 }
             }
-            if (!printed) {
+            if (!printed)
                 os << 0;
-            }
             os << std::endl;
         }
     }
     void printLowerBound(std::ostream &os, size_t i) const {
-        printBound(os, lowerA[i], lowerb[i], i, -1);
+        printBound(os, i, 1);
     }
     void printUpperBound(std::ostream &os, size_t i) const {
-        printBound(os, upperA[i], upperb[i], i, 1);
+        printBound(os, i, -1);
     }
+    // prints loops from inner most to outer most.
     friend std::ostream &operator<<(std::ostream &os,
                                     const AffineLoopNest &alnb) {
-        const size_t numLoops = alnb.getNumVar();
-        for (size_t _i = 0; _i < numLoops; ++_i) {
-            os << "Variable " << _i << " lower bounds: " << std::endl;
-            size_t i = alnb.currentToOriginalPerm(_i);
-            alnb.printLowerBound(os, i);
-            os << "Variable " << _i << " upper bounds: " << std::endl;
-            alnb.printUpperBound(os, i);
+        AffineLoopNest aln{alnb};
+        size_t i = aln.getNumVar();
+        while (true) {
+            os << "Loop " << --i << " lower bounds: " << std::endl;
+            aln.printLowerBound(os, i);
+            os << "Loop " << i << " upper bounds: " << std::endl;
+            aln.printUpperBound(os, i);
+            if (i == 0)
+                break;
+            aln.removeLoopBang(i);
         }
         return os;
     }
